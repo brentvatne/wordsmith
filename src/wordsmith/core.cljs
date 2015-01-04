@@ -1,8 +1,10 @@
 (ns wordsmith.core
   (:require-macros [cljs.core.async.macros :refer [go-loop]])
   (:require [om.core :as om :include-macros true]
-            [om.dom :as dom :include-macros true]
+            [om-tools.core :refer-macros [defcomponent defcomponentk]]
+            [om-tools.dom :as dom :include-macros true]
             [wordsmith.persistence :as p]
+            [wordsmith.handlers :as h]
             [cljs.core.async :refer [put! chan <!]]
             [goog.events :as events])
   (:import [goog.events EventType]
@@ -23,8 +25,8 @@
   om/IValue
   (-value [s] (str s)))
 
-(def app-state 
-  (atom 
+(def app-state
+  (atom
     {:input ""
      :titles []
      :title ""
@@ -32,49 +34,7 @@
      :last-input ""
      :channel (chan)}))
 
-;; Title field
-
-(defn handle-title-change
-  "Updates the app state with the latest text from the title input."
-  [event app]
-  (let [new-title (.. event -target -value)]
-    (om/update! app :title new-title)))
-
-(defn title-field
-  "Component that renders title input and handles updating of title app state."
-  [app owner]
-  (reify
-    om/IRender
-    (render [_]
-      (dom/div #js {:id "title-field"}
-        (dom/input #js {:type "text"
-                        :onChange #(handle-title-change % app)
-                        :value (:title app)})))))
-
-;; New document
-
-(defn new-document-click
-  "Sends a :new command on the app channel."
-  [app]
-  (put! (:channel @app) [:new nil]))
-
-(defn new-button
-  "Component that renders the 'add new' button and handles triggering new
-  document state on app."
-  [app owner]
-  (reify
-    om/IRender
-    (render [_]
-      (dom/button #js {:id "new-document"
-                       :onClick #(new-document-click app)}
-                  "new"))))
-
-;; Save button
-
-(defn save-button-click
-  "Sends a :save command on the app channel."
-  [app]
-  (put! (:channel @app) [:save nil]))
+;; Helpers
 
 (defn saved?
   "Determines whether or not the app state has changed since last
@@ -84,88 +44,37 @@
     (= input last-input)
     (= title last-title)))
 
-(defn save-button
-  "Component that renders the save button. The button is disabled
-  when there are no changes to title or input. Clicking the save
-  button triggers the app state to update and saves to localStorage."
-  [app owner]
-  (reify
-    om/IRender
-    (render [_]
-      (dom/button #js {:id "save-button"
-                       :disabled (saved? app)
-                       :className (when (saved? app) "disabled")
-                       :onClick #(save-button-click app)}
-                  (if (saved? app)
-                    "saved"
-                    "save")))))
-
-;; Left menu
-
-(defn change-current
-  "Sends a :change command on the app channel."
-  [event app]
-  (let [title (.. event -target -textContent)]
-    (put! (:channel @app) [:change title])))
-
-(defn delete-click
-  "Shows a prompt asking the user for confirmation. If confirmation
-  is true, sends a :remove command on the app channel."
-  [title app]
-  (let [response (js/confirm "Are you sure?")]
-    (when response
-      (put! (:channel @app) [:remove title]))))
-
-(defn left-menu
-  "Component that renders the left-menu containing all the documents
-  available in localStorage. Clicking on a title triggers an app state
-  change by sending a :change command on the app channel. Clicking on
-  a delete button does that same with the :remove command."
-  [app owner]
-  (reify
-    om/IRender
-    (render [_]
-      (dom/div #js {:id "left-menu"}
-        (apply dom/ul nil
-          (map #(dom/li 
-                  #js {:key (str %)}
-                  (dom/span #js {:className "delete-button"
-                                 :onClick (fn [e] (delete-click % app))} "x")
-                  (dom/span #js {:className "left-menu-title"
-                                 :onClick (fn [e] (change-current e app))}
-                    (om/value %)))
-               (map om/value (:titles app))))))))
-
-;; Editor
-
-(defn handle-input
-  "Handles input change and updates the input app state."
-  [event input]
-  (om/update! input (.. event -target -value)))
-
 (defn marked
   "Calls out to the marked.js library to compile input."
   [md]
   (.marked js/window md))
 
-(defn editor
-  "Component that renders the editor and preview. Compiles the app state input
-  to markdown and dangerously sets it to output-area. Editing the input-area 
-  triggers an update to the app state."
-  [input owner]
-  (reify
-    om/IRender
-    (render [_]
-      (dom/div nil
-        (dom/textarea #js {:id "input-area"
-                           :spellCheck false
-                           :onChange #(handle-input % input)
-                           :value input})
-        (dom/div 
-          #js {:id "output-area"
-               :dangerouslySetInnerHTML #js {:__html (marked input)}})))))
+(defn parse-int [x]
+  (js/parseInt x 10))
 
-;; State transformations
+(defn log [message]
+  (.log js/console message))
+
+(defn set-scroll-top [source target]
+  "Calculates the progress of scrolling in source as a percentage and
+  sets the target scroll to the same relative place."
+  (let [source-scroll-top    (parse-int (.-scrollTop source))
+        source-height        (parse-int ((.-clientHeight source)))
+        source-scroll-height (- (parse-int (.-scrollHeight source)) source-height)
+        source-percentage    (/ source-scroll-top source-scroll-height)
+        target-height        (parse-int (.-scrollHeight target))]
+    (set! (.-scrollTop target) (* source-percentage target-height))))
+
+(defn synchronize-scroll []
+  "Attaches an event listener to input-area that synchronizes the scroll
+  position to output-area. Uses Throttle to avoid triggering too often."
+  (let [input-area (. js/document (getElementById "input-area"))
+        output-area (. js/document (getElementById "output-area"))
+        throttle (Throttle. #(set-scroll-top input-area output-area) 50)]
+    (events/listen input-area EventType/SCROLL
+      #(.fire throttle))))
+
+;; State transofmration helpers
 
 (defn update-many!
   "Updates multiple keys on Om cursor to the given value."
@@ -230,75 +139,100 @@
     (om/update! app :input
       (.. js/document (getElementById "readme") -textContent trim))))
 
-;; Hot keys
+;; Components
 
-(defn listen-to-hotkeys
-  "Listens to KEYDOWN events using goog.events and checks for Ctrl+S or 
-  Cmd+S. When identified, sends a :save command on app channel."
-  [app]
-  (events/listen js/document EventType/KEYDOWN
-    #(when 
-       (and (or (.-metaKey %) (.-ctrlKey %))
-            (= 83 (.-keyCode %)))
-       (.preventDefault %)
-       (put! (:channel @app) [:save nil]))))
+(defcomponent title-field
+  "Component that renders title input and handles updating of title app state."
+  [app owner]
+  (render [_]
+    (dom/div #js {:id "title-field"}
+      (dom/input #js {:type "text"
+                      :onChange #(h/handle-title-change % app)
+                      :value (:title app)}))))
 
-;; Scroll both
+(defcomponent new-button
+  "Component that renders the 'add new' button and handles triggering new
+  document state on app."
+  [app owner]
+  (render [_]
+    (dom/button #js {:id "new-document"
+                     :onClick #(h/new-document-click app)}
+                "new")))
 
-(defn parse-int [x]
-  (js/parseInt x 10))
+(defcomponent save-button
+  "Component that renders the save button. The button is disabled
+  when there are no changes to title or input. Clicking the save
+  button triggers the app state to update and saves to localStorage."
+  [app owner]
+  (render [_]
+    (dom/button #js {:id "save-button"
+                     :disabled (saved? app)
+                     :className (when (saved? app) "disabled")
+                     :onClick #(h/save-button-click app)}
+                (if (saved? app)
+                  "saved"
+                  "save"))))
 
-(defn set-scroll-top [source target]
-  "Calculates the progress of scrolling in source as a percentage and
-  sets the target scroll to the same relative place."
-  (let [source-scroll-top (parse-int (.-scrollTop source))
-        source-height     (parse-int (.-scrollHeight source))
-        source-percentage (/ source-scroll-top source-height)
-        target-height     (parse-int (.-scrollHeight target))]
-    (set! (.-scrollTop target) (* source-percentage target-height))))
+(defcomponent left-menu
+  "Component that renders the left-menu containing all the documents
+  available in localStorage. Clicking on a title triggers an app state
+  change by sending a :change command on the app channel. Clicking on
+  a delete button does that same with the :remove command."
+  [app owner]
+  (render [_]
+    (dom/div #js {:id "left-menu"}
+      (apply dom/ul nil
+        (map #(dom/li
+                #js {:key (str %)}
+                (dom/span #js {:className "delete-button"
+                               :onClick (fn [e] (h/delete-click % app))} "x")
+                (dom/span #js {:className "left-menu-title"
+                               :onClick (fn [e] (h/change-current e app))}
+                  (om/value %)))
+             (map om/value (:titles app)))))))
 
-(defn synchronize-scroll []
-  "Attaches an event listener to input-area that synchronizes the scroll
-  position to output-area. Uses Throttle to avoid triggering too often."
-  (let [input-area (. js/document (getElementById "input-area"))
-        output-area (. js/document (getElementById "output-area"))
-        throttle (Throttle. #(set-scroll-top input-area output-area) 50)]
-    (events/listen input-area EventType/SCROLL
-      #(.fire throttle))))
+(defcomponent editor
+  "Component that renders the editor and preview. Compiles the app state input
+  to markdown and dangerously sets it to output-area. Editing the input-area 
+  triggers an update to the app state."
+  [input owner]
+  (render [_]
+    (dom/div nil
+      (dom/textarea #js {:id "input-area"
+                         :spellCheck false
+                         :onChange #(h/handle-input % input)
+                         :value input})
+      (dom/div
+        #js {:id "output-area"
+             :dangerouslySetInnerHTML #js {:__html (marked input)}}))))
 
-;; The main app
-
-(defn wordsmith-app
+(defcomponent wordsmith-app
   "The starting point of the wordsmith app. Implements will-mount and 
   render."
   [app owner]
-  (reify
-    om/IWillMount
-    (will-mount [_]
-      "Fetches document titles and starts the asynchronous command event 
-      dispatch loop which handles all major app state changing events.
-      Also attaches a KEYDOWN event listener to the page, for hot keys."
-      (om/update! app :titles (p/get-all-titles))
-      (set-initial-document! app)
-      (let [channel (:channel app)]
-        (go-loop []
-          (let [[command params] (<! channel)]
-            (dispatch command params app)
-            (recur)))))
-    om/IDidMount
-    (did-mount [_]
-      "Sets up event listeners when app has been properly loaded."
-      (listen-to-hotkeys app)
-      (synchronize-scroll))
-    om/IRender
-    (render [_]
-      "Renders the app components in a container."
-      (dom/div #js {:className "container"}
-        (om/build title-field app)
-        (om/build new-button app)
-        (om/build save-button app)
-        (om/build left-menu app)
-        (om/build editor (:input app))))))
+  (will-mount [_]
+    "Fetches document titles and starts the asynchronous command event 
+    dispatch loop which handles all major app state changing events.
+    Also attaches a KEYDOWN event listener to the page, for hot keys."
+    (om/update! app :titles (p/get-all-titles))
+    (set-initial-document! app)
+    (let [channel (:channel app)]
+      (go-loop []
+        (let [[command params] (<! channel)]
+          (dispatch command params app)
+          (recur)))))
+  (did-mount [_]
+    "Sets up event listeners when app has been properly loaded."
+    (h/listen-to-hotkeys app)
+    (synchronize-scroll))
+  (render [_]
+    "Renders the app components in a container."
+    (dom/div #js {:className "container"}
+      (om/build title-field app)
+      (om/build new-button app)
+      (om/build save-button app)
+      (om/build left-menu app)
+      (om/build editor (:input app)))))
 
 (om/root
   wordsmith-app
